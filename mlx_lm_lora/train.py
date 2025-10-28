@@ -381,13 +381,13 @@ def build_parser():
     parser.add_argument(
         "--max-generation-tokens",
         type=int,
-        default=None,
+        default=256,
         help="Maximum number of tokens to generate during on-policy distillation.",
     )
     parser.add_argument(
         "--distill-temperature",
         type=float,
-        default=None,
+        default=0.0,
         help="Sampling temperature when generating student rollouts for distillation.",
     )
     parser.add_argument(
@@ -1295,8 +1295,6 @@ def run(args, training_callback: TrainingCallback = None):
         requires_distill = requires_distill or any(
             entry["mode"] == "distill_on_policy" for entry in schedule_entries
         )
-    if args.distill_prompts_data:
-        requires_distill = True
 
     teacher_model = None
     distill_dataset = None
@@ -1313,10 +1311,13 @@ def run(args, training_callback: TrainingCallback = None):
         student_vocab = _extract_vocab(tokenizer)
         teacher_vocab = _extract_vocab(teacher_tokenizer)
         if student_vocab is not None and teacher_vocab is not None:
-            if student_vocab != teacher_vocab:
-                raise ValueError("Student and teacher tokenizers are not compatible.")
-        elif tokenizer.__class__ is not teacher_tokenizer.__class__:
-            raise ValueError("Student and teacher tokenizers use different classes.")
+            if set(student_vocab.keys()) != set(teacher_vocab.keys()):
+                raise ValueError("Student and teacher tokenizers appear to use different vocabularies.")
+        else:
+            student_eos = getattr(tokenizer, "eos_token_id", None)
+            teacher_eos = getattr(teacher_tokenizer, "eos_token_id", None)
+            if None not in (student_eos, teacher_eos) and student_eos != teacher_eos:
+                raise ValueError("Student and teacher tokenizers must share EOS token identifiers.")
 
         if args.distill_prompts_data is None:
             raise ValueError("distill_prompts_data must be provided for on-policy distillation.")

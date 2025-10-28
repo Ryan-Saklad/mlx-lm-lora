@@ -482,7 +482,7 @@ def create_dataset(
                 prompt_key=chat_feature,
             )
         else:
-            raise ValueError("Unsupported data format for Online DPO or XPO training.")
+            raise ValueError("Unsupported data format for Online DPO, XPO, or distill_on_policy training.")
     elif train_mode in ["grpo"]:
         if prompt_feature in sample:
             return GRPODataset(
