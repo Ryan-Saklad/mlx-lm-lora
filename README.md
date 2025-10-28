@@ -440,7 +440,7 @@ mlx_lm_lora.train \
 --model <model_path>              # Model path or HF repo
 --data <data_path>                # Dataset path or HF dataset name
 --train-type lora                 # lora, dora, or full
---train-mode sft                  # sft, dpo, cpo, orpo, grpo, etc.
+--train-mode sft                  # sft, dpo, cpo, orpo, grpo, distill_on_policy, etc.
 
 # Training schedule
 --batch-size 4                    # Batch size
@@ -463,6 +463,13 @@ mlx_lm_lora.train \
 --sgd-momentum 0.9               # Momentum for SGD
 --sgd-nesterov                   # Enable Nesterov momentum for SGD
 --grad-checkpoint                # Enable gradient checkpointing
+
+# Distillation
+--teacher-model <path>           # Teacher checkpoint for distillation
+--distill-prompts-data <path>    # Prompt-only dataset for distillation rollouts
+--training-schedule sft:0.7,distill_on_policy:0.3  # Mix modes by fixed proportions
+--max-generation-tokens 256      # Truncate student rollouts after this many tokens
+--distill-temperature 0.0        # Sampling temperature for student rollouts
 
 # Quantization
 --load-in-4bits                  # 4-bit quantization
@@ -776,6 +783,33 @@ mlx_lm_lora.train \
 ```shell
 --weight-decay 0.01               # Applies to optimizers with built-in weight decay support
 ```
+
+### Training Schedules
+
+```shell
+--training-schedule sft:0.8,distill_on_policy:0.2
+```
+
+- Allocates the global `--iters` budget proportionally across multiple training modes.
+- Each block runs sequentially in the order provided by the schedule list.
+- Combine with any supported training mode (currently SFT + on-policy distillation).
+
+### On-Policy Distillation
+
+```shell
+mlx_lm_lora.train \
+  --train-mode distill_on_policy \
+  --teacher-model <teacher_path> \
+  --distill-prompts-data <prompts_dir> \
+  --max-generation-tokens 256 \
+  --distill-temperature 0.0
+```
+
+- Requires the teacher to share an identical tokenizer/vocabulary with the student.
+- The prompts dataset should be prompt-only JSONL (chat-style `messages` or `prompt`) with `train.jsonl` at minimum.
+- Student rollouts are truncated at `--max-generation-tokens` without forcing EOS.
+- Distillation currently assumes `--gradient-accumulation-steps 1` for the distill phase.
+- Provide a `--training-schedule` entry (e.g., `sft:0.7,distill_on_policy:0.3`) to interleave distillation with other modes; omit it for pure distillation.
 
 ### Reward Function System (GRPO)
 

@@ -76,12 +76,28 @@ class PromptDataset:
         prompt_key: str = "prompt",
     ):
         self._data = data
-        self.chat_key = prompt_key
+        self.prompt_key = prompt_key
         self.tokenizer = tokenizer
 
     def process(self, d):
-        messages = d[self.chat_key]
-        return {"prompt": self.tokenizer.apply_chat_template(messages, add_generation_prompt=True), "prompt_text": self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)}
+        messages = d[self.prompt_key]
+        if isinstance(messages, str):
+            chat = [{"role": "user", "content": messages}]
+        elif isinstance(messages, dict):
+            chat = [messages]
+        else:
+            chat = messages
+
+        prompt_tokens = self.tokenizer.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+        )
+        prompt_text = self.tokenizer.apply_chat_template(
+            chat,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        return {"prompt": prompt_tokens, "prompt_text": prompt_text}
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -452,12 +468,18 @@ def create_dataset(
                 )
         else:
             raise ValueError("Unsupported data format for Online DPO or CPO training.")
-    elif train_mode in ["online_dpo", "xpo", "rlhf"]:
+    elif train_mode in ["online_dpo", "xpo", "rlhf", "distill_on_policy"]:
         if prompt_feature in sample:
             return PromptDataset(
                 data=data,
                 tokenizer=tokenizer,
                 prompt_key=prompt_feature,
+            )
+        if chat_feature in sample:
+            return PromptDataset(
+                data=data,
+                tokenizer=tokenizer,
+                prompt_key=chat_feature,
             )
         else:
             raise ValueError("Unsupported data format for Online DPO or XPO training.")
@@ -618,3 +640,33 @@ def load_dataset(args, tokenizer: PreTrainedTokenizer):
             "Test set not found or empty. Must provide test set for evaluation."
         )
     return train, valid, test
+
+
+def load_prompt_only_dataset(
+    data_source: str,
+    tokenizer: PreTrainedTokenizer,
+    args,
+):
+    """
+    Load a prompt-only dataset for on-policy distillation. Accepts either plain
+    prompt strings (``{"prompt": ...}``) or chat-style prompts
+    (``{"messages": [...]}``).
+    """
+    config = types.SimpleNamespace(
+        train_mode="online_dpo",
+        prompt_feature=getattr(args, "prompt_feature", "prompt"),
+        chat_feature=getattr(args, "chat_feature", "messages"),
+        system_feature=getattr(args, "system_feature", "system"),
+        mask_prompt=False,
+    )
+
+    data_path = Path(data_source)
+    if data_path.exists():
+        train, _, _ = load_local_dataset(data_path, tokenizer, config)
+    else:
+        train, _, _ = load_hf_dataset(data_source, tokenizer, config)
+
+    if len(train) == 0:
+        raise ValueError("Distillation dataset is empty.")
+
+    return train

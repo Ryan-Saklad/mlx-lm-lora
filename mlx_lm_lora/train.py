@@ -2,9 +2,9 @@ from pathlib import Path
 import importlib.util
 import argparse
 import math
-import yaml
 import sys
 import re
+import yaml
 
 import numpy as np
 
@@ -26,7 +26,8 @@ from .trainer.rflhf_trainer import RLHFTrainingArgs, evaluate_rlhf, train_rlhf
 from .trainer.xpo_trainer import  XPOTrainingArgs, evaluate_xpo, train_xpo
 from .trainer.dpo_trainer import DPOTrainingArgs, evaluate_dpo, train_dpo
 from .trainer.cpo_trainer import CPOTrainingArgs, evaluate_cpo, train_cpo
-from .trainer.datasets import CacheDataset, load_dataset
+from .trainer.distill_trainer import DistillationTrainingArgs, train_on_policy_distill
+from .trainer.datasets import CacheDataset, load_dataset, load_prompt_only_dataset
 from .utils import fuse_and_save_model, from_pretrained
 
 from mlx_lm.tuner.utils import (
@@ -70,6 +71,7 @@ CONFIG_DEFAULTS = {
         "adafactor": {},
     },
     "data": "data/",
+    "distill_prompts_data": None,
     "seed": 0,
     "num_layers": 16,
     "batch_size": 4,
@@ -86,9 +88,11 @@ CONFIG_DEFAULTS = {
     "test": False,
     "test_batches": 500,
     "max_seq_length": 2048,
+    "max_generation_tokens": 256,
     "config": None,
     "grad_checkpoint": False,
     "lr_schedule": None,
+    "training_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
     "fuse": True,
@@ -106,6 +110,8 @@ CONFIG_DEFAULTS = {
     "judge": None,
     "judge_config": {},
     "alpha": 1e-5,
+    "teacher_model": None,
+    "distill_temperature": 0.0,
 
     # GRPO args
     "group_size": 4,
@@ -147,12 +153,77 @@ def calculate_iters(train_set, batch_size, epochs) -> int:
     return iters
 
 
+def parse_training_schedule(schedule_str: str):
+    if schedule_str is None:
+        return None
+    entries = []
+    for raw_part in schedule_str.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid training schedule entry '{part}'. Expected format mode:weight."
+            )
+        mode, weight = part.split(":", 1)
+        try:
+            weight_val = float(weight.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid weight '{weight}' in training schedule.") from exc
+        entries.append({"mode": mode.strip(), "weight": weight_val})
+    if not entries:
+        raise ValueError("Training schedule was provided but no valid entries were parsed.")
+    if any(item["weight"] <= 0 for item in entries):
+        raise ValueError("Training schedule weights must be positive.")
+    return entries
+
+
+def allocate_schedule_iterations(total_iters: int, entries):
+    if total_iters is None:
+        raise ValueError("Total iterations must be specified when using a training schedule.")
+    total_weight = sum(item["weight"] for item in entries)
+    if total_weight <= 0:
+        raise ValueError("Training schedule weights must sum to a positive value.")
+
+    exact_counts = [
+        (item, total_iters * item["weight"] / total_weight) for item in entries
+    ]
+    assigned_counts = []
+    residuals = []
+    for item, exact in exact_counts:
+        count = int(math.floor(exact))
+        assigned_counts.append([item, count])
+        residuals.append((exact - count, item))
+
+    assigned_total = sum(count for _, count in assigned_counts)
+    remaining = total_iters - assigned_total
+    residuals.sort(key=lambda tup: tup[0], reverse=True)
+
+    idx = 0
+    while remaining > 0 and residuals:
+        _, item = residuals[idx % len(residuals)]
+        for entry in assigned_counts:
+            if entry[0] is item:
+                entry[1] += 1
+                remaining -= 1
+                break
+        idx += 1
+
+    return [(entry["mode"], count) for entry, count in assigned_counts]
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="LoRA or QLoRA finetuning.")
     parser.add_argument(
         "--model",
         type=str,
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--teacher-model",
+        type=str,
+        default=None,
+        help="Optional teacher model path for on-policy distillation.",
     )
     parser.add_argument(
         "--load-in-4bits",
@@ -189,6 +260,12 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--distill-prompts-data",
+        type=str,
+        default=None,
+        help="Directory or dataset id providing prompts for on-policy distillation.",
+    )
+    parser.add_argument(
         "--train-type",
         type=str,
         choices=["lora", "dora", "full"],
@@ -198,8 +275,14 @@ def build_parser():
         "--train-mode",
         type=str,
         default="sft",
-        choices=["sft", "dpo", "cpo", "orpo", "grpo", "online_dpo", "xpo", "rlhf"],
-        help="Training mode: sft, dpo, rlhf, online_dpo, xpo, cpo, orpo, or grpo, default is sft",
+        choices=["sft", "dpo", "cpo", "orpo", "grpo", "online_dpo", "xpo", "rlhf", "distill_on_policy"],
+        help="Training mode: sft, dpo, rlhf, online_dpo, xpo, cpo, orpo, grpo, or distill_on_policy. Default is sft",
+    )
+    parser.add_argument(
+        "--training-schedule",
+        type=str,
+        default=None,
+        help="Comma-separated list of mode:weight pairs to sequence training phases.",
     )
     parser.add_argument(
         "--optimizer",
@@ -294,6 +377,18 @@ def build_parser():
         "--max-seq-length",
         type=int,
         help="Maximum sequence length.",
+    )
+    parser.add_argument(
+        "--max-generation-tokens",
+        type=int,
+        default=None,
+        help="Maximum number of tokens to generate during on-policy distillation.",
+    )
+    parser.add_argument(
+        "--distill-temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature when generating student rollouts for distillation.",
     )
     parser.add_argument(
         "-c",
@@ -455,6 +550,8 @@ def train_model(
     train_set,
     valid_set,
     training_callback: TrainingCallback = None,
+    teacher_model: nn.Module = None,
+    distill_dataset=None,
 ):
     mx.random.seed(args.seed)
 
@@ -566,6 +663,71 @@ def train_model(
             args.sgd_nesterov = optimizer_config.get("nesterov", False)
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
+
+    schedule_entries = getattr(args, "_parsed_training_schedule", None)
+    if schedule_entries:
+        iteration_plan = allocate_schedule_iterations(args.iters, schedule_entries)
+        sft_train_cache = CacheDataset(train_set) if train_set and len(train_set) else None
+        sft_valid_cache = CacheDataset(valid_set) if valid_set and len(valid_set) else None
+        distill_cache = CacheDataset(distill_dataset) if distill_dataset and len(distill_dataset) else None
+
+        for mode, count in iteration_plan:
+            if count <= 0:
+                continue
+            if mode == "sft":
+                if sft_train_cache is None or sft_valid_cache is None:
+                    raise ValueError("SFT dataset is required but not available for the training schedule.")
+                sft_training_args = SFTTrainingArgs(
+                    batch_size=args.batch_size,
+                    iters=count,
+                    val_batches=args.val_batches,
+                    steps_per_report=args.steps_per_report,
+                    steps_per_eval=args.steps_per_eval,
+                    steps_per_save=args.save_every,
+                    adapter_file=adapter_file,
+                    max_seq_length=args.max_seq_length,
+                    grad_checkpoint=args.grad_checkpoint,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                )
+                train_sft(
+                    model=model,
+                    args=sft_training_args,
+                    optimizer=opt,
+                    train_dataset=sft_train_cache,
+                    val_dataset=sft_valid_cache,
+                    training_callback=training_callback,
+                )
+            elif mode == "distill_on_policy":
+                if teacher_model is None:
+                    raise ValueError("Teacher model required for distillation in training schedule.")
+                if distill_cache is None:
+                    raise ValueError("Distillation dataset required for training schedule entry.")
+                distill_args = DistillationTrainingArgs(
+                    batch_size=args.batch_size,
+                    iters=count,
+                    val_batches=0,
+                    steps_per_report=args.steps_per_report,
+                    steps_per_eval=args.steps_per_eval,
+                    steps_per_save=args.save_every,
+                    adapter_file=adapter_file,
+                    max_seq_length=args.max_seq_length,
+                    grad_checkpoint=False,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    max_generation_tokens=args.max_generation_tokens,
+                    distill_temperature=args.distill_temperature,
+                )
+                train_on_policy_distill(
+                    model=model,
+                    teacher_model=teacher_model,
+                    tokenizer=tokenizer,
+                    optimizer=opt,
+                    train_dataset=distill_cache,
+                    args=distill_args,
+                    training_callback=training_callback,
+                )
+            else:
+                raise ValueError(f"Unsupported mode '{mode}' in training schedule.")
+        return
 
     if args.train_mode == "orpo":
         orpo_training_args = ORPOTrainingArgs(
@@ -864,6 +1026,35 @@ def train_model(
             training_callback=training_callback,
         )
 
+    elif args.train_mode == "distill_on_policy":
+        if teacher_model is None:
+            raise ValueError("Teacher model must be provided for distill_on_policy training.")
+        if distill_dataset is None or len(distill_dataset) == 0:
+            raise ValueError("A non-empty distillation dataset is required for distill_on_policy training.")
+        distill_args = DistillationTrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=0,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=False,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            max_generation_tokens=args.max_generation_tokens,
+            distill_temperature=args.distill_temperature,
+        )
+        train_on_policy_distill(
+            model=model,
+            teacher_model=teacher_model,
+            tokenizer=tokenizer,
+            optimizer=opt,
+            train_dataset=CacheDataset(distill_dataset),
+            args=distill_args,
+            training_callback=training_callback,
+        )
+
     elif args.train_mode == "sft":
         sft_training_args = SFTTrainingArgs(
             batch_size=args.batch_size,
@@ -934,6 +1125,9 @@ def evaluate_model(args, model: nn.Module, tokenizer, test_set):
         print("DPO Test Metrics:")
         for metric_name, metric_value in test_metrics.items():
             print(f"  {metric_name}: {float(metric_value):.3f}")
+
+    elif args.train_mode == "distill_on_policy":
+        print("Evaluation for distill_on_policy training is not currently implemented.")
 
     elif args.train_mode == "rlhf":
         if args.reference_model_path:
@@ -1085,6 +1279,51 @@ def run(args, training_callback: TrainingCallback = None):
         quantized_load=quanziation_config,
     )
 
+    schedule_entries = None
+    raw_schedule = getattr(args, "training_schedule", None)
+    if raw_schedule:
+        if isinstance(raw_schedule, str):
+            schedule_entries = parse_training_schedule(raw_schedule)
+        elif isinstance(raw_schedule, list):
+            schedule_entries = raw_schedule
+        else:
+            raise ValueError("training_schedule must be a string or list of schedule entries.")
+    setattr(args, "_parsed_training_schedule", schedule_entries)
+
+    requires_distill = args.train_mode == "distill_on_policy"
+    if schedule_entries:
+        requires_distill = requires_distill or any(
+            entry["mode"] == "distill_on_policy" for entry in schedule_entries
+        )
+    if args.distill_prompts_data:
+        requires_distill = True
+
+    teacher_model = None
+    distill_dataset = None
+    if args.train and requires_distill:
+        if args.teacher_model is None:
+            raise ValueError("A teacher model must be provided when using on-policy distillation.")
+        teacher_model, teacher_tokenizer = from_pretrained(args.teacher_model)
+
+        def _extract_vocab(tok):
+            if hasattr(tok, "get_vocab"):
+                return tok.get_vocab()
+            return getattr(tok, "vocab", None)
+
+        student_vocab = _extract_vocab(tokenizer)
+        teacher_vocab = _extract_vocab(teacher_tokenizer)
+        if student_vocab is not None and teacher_vocab is not None:
+            if student_vocab != teacher_vocab:
+                raise ValueError("Student and teacher tokenizers are not compatible.")
+        elif tokenizer.__class__ is not teacher_tokenizer.__class__:
+            raise ValueError("Student and teacher tokenizers use different classes.")
+
+        if args.distill_prompts_data is None:
+            raise ValueError("distill_prompts_data must be provided for on-policy distillation.")
+        distill_dataset = load_prompt_only_dataset(args.distill_prompts_data, tokenizer, args)
+        if len(distill_dataset) == 0:
+            raise ValueError("Distillation dataset is empty.")
+
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
@@ -1094,7 +1333,16 @@ def run(args, training_callback: TrainingCallback = None):
 
     elif args.train:
         print("Training")
-        train_model(args, model, tokenizer, train_set, valid_set, training_callback)
+        train_model(
+            args,
+            model,
+            tokenizer,
+            train_set,
+            valid_set,
+            training_callback,
+            teacher_model=teacher_model,
+            distill_dataset=distill_dataset,
+        )
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
