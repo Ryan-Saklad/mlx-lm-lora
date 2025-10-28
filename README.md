@@ -457,8 +457,11 @@ mlx_lm_lora.train \
 --lora-parameters '{"rank": 8, "dropout": 0.0, "scale": 10.0}'
 
 # Optimization
---optimizer adam                  # adam, adamw, qhadam, muon
---lr-schedule cosine             # Learning rate schedule
+--optimizer adam                  # adam, adamw, qhadam, muon, sgd, adafactor
+--lr-schedule cosine             # Learning rate schedule (cosine or constant)
+--weight-decay 0.01              # Weight decay for supported optimizers
+--sgd-momentum 0.9               # Momentum for SGD
+--sgd-nesterov                   # Enable Nesterov momentum for SGD
 --grad-checkpoint                # Enable gradient checkpointing
 
 # Quantization
@@ -746,8 +749,7 @@ mlx_lm_lora.train \
 ### Learning Rate Schedules
 
 ```shell
---lr-schedule cosine              # Cosine annealing
---lr-schedule linear              # Linear decay
+--lr-schedule cosine              # Cosine annealing (requires --iters or --epochs)
 --lr-schedule constant            # Constant rate
 ```
 
@@ -758,6 +760,21 @@ mlx_lm_lora.train \
 --optimizer adamw                 # AdamW with weight decay
 --optimizer qhadam               # Quasi-hyperbolic Adam
 --optimizer muon                 # Muon optimizer
+--optimizer sgd                  # Stochastic Gradient Descent (momentum/Nesterov supported)
+--optimizer adafactor            # Adafactor optimizer
+```
+
+### SGD Options
+
+```shell
+--sgd-momentum 0.9                # Optional momentum factor for SGD
+--sgd-nesterov                    # Enable Nesterov momentum when using SGD
+```
+
+### Weight Decay
+
+```shell
+--weight-decay 0.01               # Applies to optimizers with built-in weight decay support
 ```
 
 ### Reward Function System (GRPO)

@@ -209,6 +209,31 @@ def build_parser():
         help="Optimizer to use for training",
     )
     parser.add_argument(
+        "--sgd-momentum",
+        type=float,
+        default=None,
+        help="Momentum factor for SGD (requires --optimizer sgd)",
+    )
+    parser.add_argument(
+        "--sgd-nesterov",
+        action="store_true",
+        default=None,
+        help="Enable Nesterov momentum for SGD",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=None,
+        help="Weight decay to apply when supported by the optimizer",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        type=str,
+        choices=["cosine", "constant"],
+        default=None,
+        help="Learning rate schedule to apply",
+    )
+    parser.add_argument(
         "--mask-prompt",
         action="store_true",
         help="Mask the prompt in the loss when training",
@@ -471,10 +496,44 @@ def train_model(
     save_config(vars(args), adapter_path / "adapter_config.json")
 
     # Initialize the selected optimizer
-    lr = build_schedule(args.lr_schedule) if args.lr_schedule else args.learning_rate
+    lr_schedule_config = args.lr_schedule
+    schedule_spec = lr_schedule_config
+
+    if isinstance(lr_schedule_config, str):
+        schedule_name = lr_schedule_config.lower()
+        schedule_spec = schedule_name
+        if schedule_name == "constant":
+            lr_schedule_config = None
+        elif schedule_name == "cosine":
+            if args.iters is None:
+                raise ValueError(
+                    "Cosine learning rate schedule requires the total number of iterations; "
+                    "specify --iters or --epochs."
+                )
+            lr_schedule_config = {
+                "name": "cosine_decay",
+                "arguments": [args.learning_rate, args.iters],
+            }
+        else:
+            raise ValueError(f"Unsupported learning rate schedule: {schedule_name}")
+
+    if lr_schedule_config:
+        lr = build_schedule(lr_schedule_config)
+        args.lr_schedule = lr_schedule_config
+    else:
+        lr = args.learning_rate
+        args.lr_schedule = schedule_spec if schedule_spec == "constant" else None
 
     optimizer_name = args.optimizer.lower()
-    optimizer_config = args.optimizer_config.get(optimizer_name, {})
+    optimizer_config = dict(args.optimizer_config.get(optimizer_name, {}))
+
+    weight_decay_supported = {"adamw", "muon", "sgd"}
+    if optimizer_name in weight_decay_supported:
+        if args.weight_decay is not None:
+            optimizer_config["weight_decay"] = args.weight_decay
+        else:
+            optimizer_config.setdefault("weight_decay", 0.0)
+        args.weight_decay = optimizer_config.get("weight_decay")
 
     if optimizer_name == "adam":
         opt_class = optim.Adam
@@ -486,10 +545,25 @@ def train_model(
         opt_class = optim.Muon
     elif optimizer_name == "sgd":
         opt_class = optim.SGD
+        if args.sgd_momentum is not None:
+            optimizer_config["momentum"] = args.sgd_momentum
+        elif "momentum" not in optimizer_config:
+            optimizer_config["momentum"] = 0.0
+
+        if args.sgd_nesterov is not None:
+            optimizer_config["nesterov"] = args.sgd_nesterov
+        elif "nesterov" not in optimizer_config:
+            optimizer_config["nesterov"] = False
     elif optimizer_name == "adafactor":
         opt_class = optim.Adafactor
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+    if optimizer_name == "sgd":
+        if args.sgd_momentum is None:
+            args.sgd_momentum = optimizer_config.get("momentum", 0.0)
+        if args.sgd_nesterov is None:
+            args.sgd_nesterov = optimizer_config.get("nesterov", False)
 
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
