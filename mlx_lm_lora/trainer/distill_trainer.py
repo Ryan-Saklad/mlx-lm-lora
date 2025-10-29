@@ -39,6 +39,7 @@ def _sample_student_responses(
     prompt_token_sequences: List[List[int]],
     max_tokens: int,
     temperature: float,
+    max_output_tokens: List[int],
 ) -> List[List[int]]:
     eos_tokens = getattr(tokenizer, "eos_token_ids", None)
     if eos_tokens is None:
@@ -58,12 +59,15 @@ def _sample_student_responses(
     )
 
     completions: List[List[int]] = []
-    for prompt_text, prompt_tokens in zip(prompt_texts, prompt_token_sequences):
+    for prompt_text, prompt_tokens, allowed_tokens in zip(
+        prompt_texts, prompt_token_sequences, max_output_tokens
+    ):
+        current_max = max(1, min(max_tokens, allowed_tokens))
         completion = generate(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt_text,
-            max_tokens=max_tokens,
+            max_tokens=current_max,
             sampler=sampler,
             verbose=False,
         )
@@ -82,8 +86,8 @@ def _sample_student_responses(
         ):
             completion_ids = completion_ids[prompt_length:]
 
-        if max_tokens is not None:
-            completion_ids = completion_ids[:max_tokens]
+        if current_max is not None:
+            completion_ids = completion_ids[:current_max]
         completions.append(list(completion_ids))
     return completions
 
@@ -94,6 +98,7 @@ def _prepare_distill_inputs(
     batch,
     max_tokens: int,
     temperature: float,
+    max_seq_length: int,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     prompts, prompt_texts = batch
     prompt_token_sequences = []
@@ -105,6 +110,11 @@ def _prepare_distill_inputs(
         else:
             prompt_token_sequences.append([int(p)])
 
+    allowed_token_budget: List[int] = []
+    for prompt_tokens in prompt_token_sequences:
+        headroom = max_seq_length - len(prompt_tokens) - 1
+        allowed_token_budget.append(max(1, headroom))
+
     was_training = model.training
     model.eval()
     try:
@@ -115,6 +125,7 @@ def _prepare_distill_inputs(
             prompt_token_sequences=prompt_token_sequences,
             max_tokens=max_tokens,
             temperature=temperature,
+            max_output_tokens=allowed_token_budget,
         )
     finally:
         if was_training:
@@ -125,7 +136,9 @@ def _prepare_distill_inputs(
     lengths: List[int] = []
 
     for prompt_tokens, completion_ids in zip(prompt_token_sequences, completions):
-        sequence = prompt_tokens + completion_ids
+        allowed_total = max_seq_length - len(prompt_tokens)
+        trimmed_completion = completion_ids[:max(0, allowed_total)]
+        sequence = prompt_tokens + trimmed_completion
         if len(sequence) <= len(prompt_tokens):
             # No generated tokens; skip this sample
             continue
@@ -169,18 +182,22 @@ def train_on_policy_distill(
     training_callback: TrainingCallback = None,
 ):
     teacher_model.eval()
-    teacher_model.freeze()
+    if hasattr(teacher_model, "freeze"):
+        teacher_model.freeze()
+    elif hasattr(teacher_model, "parameters"):
+        for param in teacher_model.parameters():
+            if hasattr(param, "requires_grad"):
+                param.requires_grad = False
     model.train()
 
     world = mx.distributed.init()
-    world_size = world.size()
     rank = world.rank()
 
     if args.gradient_accumulation_steps != 1 and rank == 0:
         tqdm.write(
             "[distill] gradient_accumulation_steps > 1 detected; overriding to 1 for distillation phase."
         )
-    args.gradient_accumulation_steps = 1
+    grad_accum_steps = 1
 
     iterator = iterate_online_dpo_batches(
         dataset=train_dataset,
@@ -240,6 +257,7 @@ def train_on_policy_distill(
             batch=batch,
             max_tokens=args.max_generation_tokens,
             temperature=args.distill_temperature,
+            max_seq_length=args.max_seq_length,
         )
         if prepared is None:
             consecutive_empty += 1

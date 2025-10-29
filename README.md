@@ -806,10 +806,11 @@ mlx_lm_lora.train \
 ```
 
 - Requires the teacher to share an identical tokenizer/vocabulary with the student.
-- The teacher logits are computed on the student's rollouts; ensure the tokenizer vocabularies align.
+- The teacher logits are computed on the student's rollouts; tokenizer vocabularies and token→id mappings must match (including EOS/BOS/PAD/UNK ids).
 - The prompts dataset should be prompt-only JSONL (chat-style `messages` or `prompt`) with `train.jsonl` at minimum.
 - Student rollouts are truncated at `--max-generation-tokens` without forcing EOS.
 - Distillation automatically uses `--gradient-accumulation-steps 1` during the distill phase regardless of outer settings.
+- Leave headroom in `--max-seq-length` for generated tokens; the trainer clips generation to stay within the model context window.
 - Provide a `--training-schedule` entry (e.g., `sft:0.7,distill_on_policy:0.3`) to interleave distillation with other modes; omit it for pure distillation.
 
 ### Reward Function System (GRPO)

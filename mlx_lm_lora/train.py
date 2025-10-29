@@ -1266,17 +1266,17 @@ def run(args, training_callback: TrainingCallback = None):
     # model, tokenizer = load(args.model)
 
     if args.load_in_4bits:
-        quanziation_config = {"bits": 4, "group_size": 64}
+        quantization_config = {"bits": 4, "group_size": 64}
     elif args.load_in_6bits:
-        quanziation_config = {"bits": 6, "group_size": 64}
+        quantization_config = {"bits": 6, "group_size": 64}
     elif args.load_in_8bits:
-        quanziation_config = {"bits": 8, "group_size": 64}
+        quantization_config = {"bits": 8, "group_size": 64}
     else:
-        quanziation_config = None
+        quantization_config = None
 
     model, tokenizer = from_pretrained(
         model=args.model,
-        quantized_load=quanziation_config,
+        quantized_load=quantization_config,
     )
 
     schedule_entries = None
@@ -1311,13 +1311,23 @@ def run(args, training_callback: TrainingCallback = None):
         student_vocab = _extract_vocab(tokenizer)
         teacher_vocab = _extract_vocab(teacher_tokenizer)
         if student_vocab is not None and teacher_vocab is not None:
-            if set(student_vocab.keys()) != set(teacher_vocab.keys()):
-                raise ValueError("Student and teacher tokenizers appear to use different vocabularies.")
+            if student_vocab != teacher_vocab:
+                raise ValueError("Student and teacher tokenizers appear to use different token-id mappings.")
         else:
-            student_eos = getattr(tokenizer, "eos_token_id", None)
-            teacher_eos = getattr(teacher_tokenizer, "eos_token_id", None)
-            if None not in (student_eos, teacher_eos) and student_eos != teacher_eos:
-                raise ValueError("Student and teacher tokenizers must share EOS token identifiers.")
+            special_tokens = [
+                "bos_token_id",
+                "eos_token_id",
+                "pad_token_id",
+                "unk_token_id",
+                "sep_token_id",
+            ]
+            for attr in special_tokens:
+                student_id = getattr(tokenizer, attr, None)
+                teacher_id = getattr(teacher_tokenizer, attr, None)
+                if None not in (student_id, teacher_id) and student_id != teacher_id:
+                    raise ValueError(
+                        f"Student and teacher tokenizers must agree on {attr.replace('_', ' ')}."
+                    )
 
         if args.distill_prompts_data is None:
             raise ValueError("distill_prompts_data must be provided for on-policy distillation.")
@@ -1325,8 +1335,22 @@ def run(args, training_callback: TrainingCallback = None):
         if len(distill_dataset) == 0:
             raise ValueError("Distillation dataset is empty.")
 
-    print("Loading datasets")
-    train_set, valid_set, test_set = load_dataset(args, tokenizer)
+    need_train_data = True
+    if args.train and not args.test:
+        if schedule_entries:
+            schedule_modes = {entry["mode"] for entry in schedule_entries}
+            if schedule_modes <= {"distill_on_policy"}:
+                need_train_data = False
+        elif args.train_mode == "distill_on_policy":
+            need_train_data = False
+
+    if need_train_data or args.test:
+        print("Loading datasets")
+        train_set, valid_set, test_set = load_dataset(args, tokenizer)
+    else:
+        train_set = []
+        valid_set = []
+        test_set = []
 
     if args.test and not args.train:
         if args.adapter_path != "":
