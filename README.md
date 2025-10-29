@@ -811,6 +811,7 @@ mlx_lm_lora.train \
 - Student rollouts are truncated at `--max-generation-tokens` without forcing EOS.
 - Distillation automatically uses `--gradient-accumulation-steps 1` during the distill phase regardless of outer settings.
 - Leave headroom in `--max-seq-length` for generated tokens; the trainer clips generation to stay within the model context window.
+- During distillation the student switches to evaluation mode for generation and returns to training immediately afterwards.
 - Provide a `--training-schedule` entry (e.g., `sft:0.7,distill_on_policy:0.3`) to interleave distillation with other modes; omit it for pure distillation.
 
 ### Reward Function System (GRPO)

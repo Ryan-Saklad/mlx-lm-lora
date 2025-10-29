@@ -62,7 +62,15 @@ def _sample_student_responses(
     for prompt_text, prompt_tokens, allowed_tokens in zip(
         prompt_texts, prompt_token_sequences, max_output_tokens
     ):
-        current_max = max(1, min(max_tokens, allowed_tokens))
+        allowed_tokens = max(0, allowed_tokens)
+        if allowed_tokens == 0:
+            completions.append([])
+            continue
+        if max_tokens is None:
+            current_max = max(1, allowed_tokens)
+        else:
+            current_max = max(1, min(max_tokens, allowed_tokens))
+
         completion = generate(
             model=model,
             tokenizer=tokenizer,
@@ -78,13 +86,18 @@ def _sample_student_responses(
         else:
             completion_ids = list(completion)
 
-        prompt_length = len(prompt_tokens)
-        if (
-            prompt_length > 0
-            and len(completion_ids) >= prompt_length
-            and completion_ids[:prompt_length] == prompt_tokens
-        ):
-            completion_ids = completion_ids[prompt_length:]
+        prompt_encoded = tokenizer.encode(prompt_text)
+        prefix_len = len(prompt_encoded)
+        if prefix_len and len(completion_ids) >= prefix_len and completion_ids[:prefix_len] == prompt_encoded:
+            completion_ids = completion_ids[prefix_len:]
+        else:
+            prompt_length = len(prompt_tokens)
+            if (
+                prompt_length > 0
+                and len(completion_ids) >= prompt_length
+                and completion_ids[:prompt_length] == prompt_tokens
+            ):
+                completion_ids = completion_ids[prompt_length:]
 
         if current_max is not None:
             completion_ids = completion_ids[:current_max]
@@ -112,8 +125,8 @@ def _prepare_distill_inputs(
 
     allowed_token_budget: List[int] = []
     for prompt_tokens in prompt_token_sequences:
-        headroom = max_seq_length - len(prompt_tokens) - 1
-        allowed_token_budget.append(max(1, headroom))
+        headroom = max(0, max_seq_length - len(prompt_tokens))
+        allowed_token_budget.append(headroom)
 
     was_training = model.training
     model.eval()
@@ -136,8 +149,8 @@ def _prepare_distill_inputs(
     lengths: List[int] = []
 
     for prompt_tokens, completion_ids in zip(prompt_token_sequences, completions):
-        allowed_total = max_seq_length - len(prompt_tokens)
-        trimmed_completion = completion_ids[:max(0, allowed_total)]
+        allowed_total = max(0, max_seq_length - len(prompt_tokens))
+        trimmed_completion = completion_ids[:allowed_total]
         sequence = prompt_tokens + trimmed_completion
         if len(sequence) <= len(prompt_tokens):
             # No generated tokens; skip this sample
@@ -197,7 +210,6 @@ def train_on_policy_distill(
         tqdm.write(
             "[distill] gradient_accumulation_steps > 1 detected; overriding to 1 for distillation phase."
         )
-    grad_accum_steps = 1
 
     iterator = iterate_online_dpo_batches(
         dataset=train_dataset,
